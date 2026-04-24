@@ -3,63 +3,85 @@ from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 
 # --- CONFIGURATION ---
-ADMIN_PASSWORD = "ton_mot_de_passe" # ⚠️ CHANGE-LE !
+ADMIN_PASSWORD = "ton_mot_de_passe" # ⚠️ À changer
+MONTANT_PAR_MOTIF = 500 # Exemple : 500 FCFA par motif (à adapter)
 
-st.set_page_config(page_title="Finance Classe AS1A", layout="wide")
+st.set_page_config(page_title="Gestion Finance AS1A", layout="wide")
 
-# Connexion au Google Sheet
+# Connexion Google Sheets
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Chargement des données
-df = conn.read(ttl=0) # ttl=0 pour forcer la lecture des données fraîches
+try:
+    # Lecture des données (ttl=0 pour avoir le direct)
+    df = conn.read(ttl=0)
+    df.columns = [str(c).strip() for c in df.columns] # Nettoie les espaces
 
-# On définit les motifs (les colonnes après 'Nom' et 'Surplus')
-# On suppose que ton Sheet a : Nom, Surplus, GEH, MOMENT DE JOIE...
-all_columns = df.columns.tolist()
-motifs_cols = [c for c in all_columns if c not in ["Nom", "Surplus"]]
+    # Détection automatique des colonnes de motifs
+    # On considère que tout ce qui n'est pas "Nom" ou "Surplus" est un motif de paiement
+    colonnes_fixes = ["Nom", "Surplus"]
+    motifs = [c for c in df.columns if c not in colonnes_fixes]
 
-# --- INTERFACE ---
-st.sidebar.title("🔐 Administration")
-pwd_input = st.sidebar.text_input("Mot de passe", type="password")
-is_admin = (pwd_input == ADMIN_PASSWORD)
+    st.title("📊 Suivi des Cotisations Dynamique")
 
-st.title("📊 Suivi des Cotisations - Google Sheets Edition")
+    # --- LOGIQUE DE CALCUL ---
+    # On calcule le reste à payer pour chaque élève
+    def calculer_reste(row):
+        nb_paye = sum(1 for m in motifs if str(row[m]).strip() == "✅")
+        nb_total = len(motifs)
+        total_du = nb_total * MONTANT_PAR_MOTIF
+        deja_paye = (nb_paye * MONTANT_PAR_MOTIF) + float(row["Surplus"] if pd.notnull(row["Surplus"]) else 0)
+        reste = total_du - deja_paye
+        return max(0, reste)
 
-if is_admin:
-    st.header("🛠 Espace Admin")
-    nom_sel = st.selectbox("Élève à modifier", df["Nom"].unique())
-    idx = df.index[df["Nom"] == nom_sel][0]
+    df["Reste à Payer"] = df.apply(calculer_reste, axis=1)
+
+    # --- ESPACE ADMIN ---
+    st.sidebar.title("🔐 Administration")
+    pwd = st.sidebar.text_input("Mot de passe", type="password")
     
-    cols_edit = st.columns(len(motifs_cols) + 1)
-    
-    # Modification des motifs (cases à cocher)
-    for i, m in enumerate(motifs_cols):
-        val_actuelle = df.at[idx, m]
-        # On gère si la case est vide ou contient "Payé"
-        is_checked = True if str(val_actuelle).strip().lower() in ["true", "payé", "✅ payé"] else False
-        df.at[idx, m] = cols_edit[i].checkbox(m, value=is_checked, key=f"ch_{idx}_{m}")
-    
-    # Modification du Surplus
-    df.at[idx, "Surplus"] = cols_edit[-1].number_input("Surplus", value=float(df.at[idx, "Surplus"]), key=f"sur_{idx}")
-
-    if st.button("💾 Enregistrer dans Google Sheets"):
-        # On transforme les booléens en texte propre avant l'envoi
-        for m in motifs_cols:
-            df[m] = df[m].apply(lambda x: "✅ Payé" if x == True or str(x) == "✅ Payé" else "❌ Impayé")
+    if pwd == ADMIN_PASSWORD:
+        st.header("🛠 Mise à jour des paiements")
+        nom_sel = st.selectbox("Sélectionner l'élève", df["Nom"].dropna().unique())
+        idx = df.index[df["Nom"] == nom_sel][0]
         
-        conn.update(data=df)
-        st.success("Données sauvegardées pour toujours !")
-        st.rerun()
+        with st.form("modif_form"):
+            st.write(f"Modifications pour **{nom_sel}**")
+            
+            # Création dynamique des cases à cocher selon les colonnes du Sheet
+            cols = st.columns(min(len(motifs), 4)) # Affiche par rangées de 4
+            for i, m in enumerate(motifs):
+                val_actuelle = str(df.at[idx, m]).strip()
+                with cols[i % 4]:
+                    check = st.checkbox(m, value=(val_actuelle == "✅"))
+                    df.at[idx, m] = "✅" if check else "❌"
+            
+            # Gestion du surplus
+            current_surplus = float(df.at[idx, "Surplus"]) if pd.notnull(df.at[idx, "Surplus"]) else 0.0
+            df.at[idx, "Surplus"] = st.number_input("Surplus / Avance (FCFA)", value=current_surplus)
+            
+            if st.form_submit_button("💾 Enregistrer sur Google Sheets"):
+                # Avant de sauvegarder, on retire la colonne calculée "Reste à Payer" 
+                # car elle ne doit pas être écrite dans le Sheet
+                df_save = df.drop(columns=["Reste à Payer"])
+                conn.update(data=df_save)
+                st.success("Données synchronisées !")
+                st.rerun()
 
-# --- AFFICHAGE PUBLIC ---
-st.divider()
-st.subheader("📋 État de la classe")
+    # --- AFFICHAGE PUBLIC ---
+    st.divider()
+    st.subheader("📋 État Global de la Classe")
+    
+    # On affiche le tableau avec le Reste à Payer bien en évidence
+    st.dataframe(
+        df, 
+        use_container_width=True, 
+        hide_index=True,
+        column_order=["Nom"] + motifs + ["Surplus", "Reste à Payer"]
+    )
 
-# On crée une copie pour l'affichage visuel
-df_visuel = df.copy()
+    st.info(f"Note : Le calcul est basé sur {MONTANT_PAR_MOTIF} FCFA par motif.")
 
-# Affichage du tableau
-st.dataframe(df_visuel, use_container_width=True, hide_index=True)
-
-if not is_admin:
-    st.info("Connectez-vous dans la barre latérale pour modifier les statuts.")
+except Exception as e:
+    st.error(f"Erreur de structure : {e}")
+    st.info("Vérifiez que votre Google Sheet a bien une colonne 'Nom' et une colonne 'Surplus'.")
+    
